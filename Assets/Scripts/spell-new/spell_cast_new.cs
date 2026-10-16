@@ -286,7 +286,7 @@ public class spell_cast_new : MonoBehaviour
             currentSpellRb.isKinematic = false;
 
             Vector3 shootDir = spellSpawnPoint != null ? spellSpawnPoint.forward : transform.forward;
-            currentSpellRb.velocity = shootDir * spellShootForce;
+            currentSpellRb.linearVelocity = shootDir * spellShootForce;
         }
         
         // Zniszczenie obiektu po czasie życia pocisku (zdefiniowane w innym skrypcie/prefabie)

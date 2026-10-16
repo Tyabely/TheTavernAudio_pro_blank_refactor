@@ -1,0 +1,7 @@
+﻿<Solution>
+  <Project Path="FMODUnityEditor.csproj" />
+  <Project Path="Assembly-CSharp.csproj" />
+  <Project Path="FMODUnityResonanceEditor.csproj" />
+  <Project Path="FMODUnity.csproj" />
+  <Project Path="FMODUnityResonance.csproj" />
+</Solution>
