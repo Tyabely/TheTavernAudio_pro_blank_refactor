@@ -1,313 +1,315 @@
 ﻿using UnityEngine;
-using FMOD.Studio; // Wymagane dla PLAYBACK_STATE
-using FMODUnity;   // Wymagane dla RuntimeManager
-using System.Collections;
-// Usunięto: using Unity.VisualScripting;
+using FMOD.Studio; // PLAYBACK_STATE
+using FMODUnity;   // RuntimeManager, RuntimeUtils
 
+// Rzucanie zaklęcia z kamery: ładowanie (LPM trzymany), wystrzał (puszczenie LPM),
+// anulowanie (PPM albo puszczenie LPM przed naładowaniem).
 public class spell_cast_new : MonoBehaviour
 {
-    // --- KONFIGURACJA ZAKLĘCIA (WIZUALNA I FIZYCZNA) ---
-    public float chargeTime = 0.5f;
-    public GameObject spellPrefab;
-    public Transform spellSpawnPoint;
-    public float spellShootForce = 20f;
-    public Color chargeStartColor = Color.black;
-    public Color chargeEndColor = new Color(1f, 0.6235f, 0f);
-    public string chargedChildName = "ChargedFX";
-    public AnimationCurve chargeCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+    [Header("Zaklęcie")]
+    public GameObject spellPrefab;
+    public Transform spellSpawnPoint;
+    public float chargeTime = 0.5f;
+    public float spellShootForce = 20f;
 
-    // --- ZMIENNE PRYWATNE (STAN) ---
-    private float chargeTimer = 0f;
-    private float scaleValue = 0f;
-    private SpellState currentState = SpellState.Idle;
-    
-    // Referencje do obiektu pocisku
-    private GameObject currentSpellInstance;
-    private Rigidbody currentSpellRb;
-    private Transform currentVfxTransform;
-    private ParticleSystem currentParticleSystem;
-    private GameObject chargedChildInstance;
+    [Header("Wygląd ładowania")]
+    public Color chargeStartColor = Color.black;
+    public Color chargeEndColor = new Color(1f, 0.6235f, 0f);
+    public AnimationCurve chargeCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+    [Tooltip("Barwi też dym na roocie prefabu (tak działała stara wersja).")]
+    public bool tintRootSmoke = false;
 
-    // --- INTEGRACJA AUDIO FMOD ---
-    private AudioSystem audioSystem;
-    private PLAYBACK_STATE audioPbState;
-    private const string STOPPED_STATE = "STOPPED"; 
-    private bool isAudioInitialized = false; // FLAGA BEZPIECZEŃSTWA
+    [Header("Zapasowe nazwy dzieci (gdy prefab nie ma spell_new z przypisanymi polami)")]
+    public string chargeChildFallbackName = "Charge_FX";
+    public string chargedChildFallbackName = "Charged_FX";
 
-    enum SpellState
-    {
-        Idle,
-        Charging,
-        Holding
-    }
+    private enum SpellState { Idle, Charging, Holding }
+    private SpellState currentState = SpellState.Idle;
+    private float chargeTimer = 0f;
 
-    // Wykonuje się przed Start() - idealne do pobierania referencji do singletonów
-    void Awake() 
-    {
-        // 1. POBIERANIE AUDIO SYSTEM
-        audioSystem = FindObjectOfType<AudioSystem>();
+    // Referencje do aktualnie ładowanego pocisku
+    private GameObject currentSpellInstance;
+    private Rigidbody currentSpellRb;
+    private Collider[] currentSpellColliders;
+    private spell_new currentSpellLogic;
+    private Transform chargeVfxTransform;
+    private Vector3 chargeVfxBaseScale = Vector3.one;
+    private ParticleSystem[] tintedParticleSystems = new ParticleSystem[0];
+    private GameObject chargedVfx;
 
-        if (audioSystem == null)
-        {
-            Debug.LogWarning("POMOCNIK: Wymagany skrypt AudioSystem nie został znaleziony na scenie. Kontynuuję bez audio.");
-            return; 
-        }
+    // Audio FMOD
+    private AudioSystem audioSystem;
+    private bool isAudioInitialized = false;
 
-        // 2. TWORZENIE INSTANCJI DŹWIĘKU 
-        // POPRAWKA BŁĘDU CS1061: Zamiast isValid() sprawdzamy, czy Path w EventReference jest pusty.
-        if (!string.IsNullOrEmpty(audioSystem.spellEvent.Path))
+    void Awake()
+    {
+        audioSystem = FindFirstObjectByType<AudioSystem>();
+
+        if (audioSystem == null)
         {
-             audioSystem.SpellSound = RuntimeManager.CreateInstance(audioSystem.spellEvent);
-            isAudioInitialized = true; 
+            Debug.LogWarning("POMOCNIK: Nie znaleziono AudioSystem na scenie. Kontynuuję bez audio.");
+            return;
+        }
+
+        // EventReference.Path istnieje tylko w edytorze (build by się nie skompilował).
+        // IsNull działa wszędzie.
+        if (!audioSystem.spellEvent.IsNull)
+        {
+            audioSystem.SpellSound = RuntimeManager.CreateInstance(audioSystem.spellEvent);
+            isAudioInitialized = true;
         }
         else
         {
-            Debug.LogWarning("POMOCNIK: Brak przypisanego FMOD Eventu dla zaklęcia lub Event jest niepoprawny. Kontynuuję bez audio.");
+            Debug.LogWarning("POMOCNIK: Brak przypisanego FMOD Eventu dla zaklęcia. Kontynuuję bez audio.");
         }
-    }
+    }
 
-    void Update()
-    {
-        switch (currentState)
-        {
-            case SpellState.Idle:
-                HandleIdleState();
-                break;
-            case SpellState.Charging:
-                HandleChargingState();
-                break;
-            case SpellState.Holding:
-                HandleHoldingState();
-                break;
-        }
-        
-        // Aktualizacja atrybutów 3D dla dźwięku - wywołuj tylko, jeśli jest inicjalizacja
-        if (isAudioInitialized)
-            audioSystem.SpellSound.set3DAttributes(FMODUnity.RuntimeUtils.To3DAttributes(transform));
-    }
+    void Update()
+    {
+        switch (currentState)
+        {
+            case SpellState.Idle: HandleIdleState(); break;
+            case SpellState.Charging: HandleChargingState(); break;
+            case SpellState.Holding: HandleHoldingState(); break;
+        }
 
-    void HandleIdleState()
-    {
-        if (Input.GetMouseButtonDown(0))
-        {
-            bool shouldStartCharging = true;
-            
-            if (isAudioInitialized)
-            {
-                // --- LOGIKA AUDIO: SPRAWDZENIE STANU ODTWARZANIA ---
-                audioSystem.SpellSound.getPlaybackState(out audioPbState);
-                
-                // Kontynuuj ładowanie tylko, jeśli dźwięk jest zatrzymany (i audio działa)
-                if (audioPbState.ToString() != STOPPED_STATE) 
-                {
-                    shouldStartCharging = false;
-                }
-            }
-            
-            if (shouldStartCharging) 
-            {
-                chargeTimer = 0f;
-                currentState = SpellState.Charging;
-                SpawnSpell();
-                
-                // --- LOGIKA AUDIO: ODPALENIE DŹWIĘKU (tylko jeśli jest inicjalizacja) ---
-                if (isAudioInitialized)
-                    audioSystem.SpellCast();
-            }
-        }
-    }
+        if (isAudioInitialized)
+            audioSystem.SpellSound.set3DAttributes(RuntimeUtils.To3DAttributes(transform));
+    }
 
-    void HandleChargingState()
-    {
-        if (Input.GetMouseButton(0))
-        {
-            chargeTimer += Time.deltaTime;
-            FollowSpawnPoint();
-            float t = Mathf.Clamp01(chargeTimer / chargeTime);
-            scaleValue = chargeCurve.Evaluate(t);
-            UpdateChargingVfx(t);
+    // ---------------- STANY ----------------
 
-            if (chargeTimer >= chargeTime && currentState != SpellState.Holding)
-            {
-                currentState = SpellState.Holding;
-                SetFullyChargedVfx();
-            }
-        }
+    void HandleIdleState()
+    {
+        if (Input.GetMouseButtonDown(0) && CanStartCast())
+            StartCharging();
+    }
 
-        if (Input.GetMouseButtonUp(0))
-        {
-            if (chargeTimer >= chargeTime)
-            {
-                FireSpell("released at end of CHARGING");
-            }
-            else
-            {
-                CancelSpell();
-                // --- LOGIKA AUDIO: Anulowanie przy wczesnym puszczeniu ---
-                if (isAudioInitialized)
-                    audioSystem.SpellCancel();
-            }
-            
-            // --- LOGIKA AUDIO: Zatrzymanie głównego dźwięku ładowania po każdym zakończeniu ---
-            if (isAudioInitialized)
-                audioSystem.SpellRelease();
+    void HandleChargingState()
+    {
+        // Pocisk zniknął z zewnątrz (np. zniszczony innym skryptem)
+        if (currentSpellInstance == null) { CancelCast(); return; }
 
-            chargeTimer = 0f;
-            currentState = SpellState.Idle;
-        }
+        if (Input.GetMouseButtonDown(1)) { CancelCast(); return; }
 
-        // Dodatkowy warunek do obsługi anulowania przez PPM
-        if (Input.GetMouseButtonDown(1))
-        {
-            CancelSpell();
-            
-            // --- LOGIKA AUDIO: Anulowanie PPM (poprawka logiki) ---
-            if (isAudioInitialized)
-            {
-                audioSystem.SpellCancel(); 
-                audioSystem.SpellRelease();
-            }
-                
-            
-            chargeTimer = 0f;
-            currentState = SpellState.Idle;
-        }
-    }
+        // LPM puszczony przed pełnym naładowaniem = anulowanie
+        if (!Input.GetMouseButton(0)) { CancelCast(); return; }
 
-    void HandleHoldingState()
-    {
-        FollowSpawnPoint();
-        scaleValue = 1f;
+        chargeTimer += Time.deltaTime;
+        float t = chargeTime > 0f ? Mathf.Clamp01(chargeTimer / chargeTime) : 1f;
 
-        if (Input.GetMouseButtonUp(0))
-        {
-            FireSpell("released during HOLDING");
-            
-            // --- LOGIKA AUDIO: ZATRZYMANIE DŹWIĘKU ---
-            if (isAudioInitialized)
-                audioSystem.SpellRelease();
-            
-            chargeTimer = 0f;
-            currentState = SpellState.Idle;
-        }
+        FollowSpawnPoint();
+        ApplyChargeVisuals(chargeCurve.Evaluate(t), t);
 
-        if (Input.GetMouseButtonDown(1))
-        {
-            // ANULOWANIE 2: Naciśnięcie PPM z naładowanym zaklęciem
-            CancelSpell();
-            
-            // --- LOGIKA AUDIO: Anulowanie PPM (poprawka logiki) ---
-            if (isAudioInitialized)
-            {
-                audioSystem.SpellCancel(); 
-                audioSystem.SpellRelease();
-            }
+        if (t >= 1f)
+        {
+            currentState = SpellState.Holding;
+            SetFullyChargedVisuals();
+        }
+    }
 
-            chargeTimer = 0f;
-            currentState = SpellState.Idle;
-        }
-    }
+    void HandleHoldingState()
+    {
+        if (currentSpellInstance == null) { CancelCast(); return; }
 
-    void SpawnSpell()
-    {
-        if (spellPrefab == null || spellSpawnPoint == null) return;
+        if (Input.GetMouseButtonDown(1)) { CancelCast(); return; }
 
-        currentSpellInstance = Instantiate(spellPrefab, spellSpawnPoint.position, spellSpawnPoint.rotation);
-        
-        // ... (Reszta logiki SpawnSpell bez zmian) ...
-        currentSpellRb = currentSpellInstance.GetComponent<Rigidbody>();
-        if (currentSpellRb != null)
-            currentSpellRb.isKinematic = true;
+        FollowSpawnPoint();
 
-        currentParticleSystem = currentSpellInstance.GetComponentInChildren<ParticleSystem>();
-        if (currentParticleSystem != null)
-        {
-            currentVfxTransform = currentParticleSystem.transform;
-            currentVfxTransform.localScale = Vector3.zero;
-            var main = currentParticleSystem.main;
-            main.startColor = chargeStartColor;
-        }
+        if (!Input.GetMouseButton(0))
+            ReleaseCast();
+    }
 
-        chargedChildInstance = null;
-        if (!string.IsNullOrEmpty(chargedChildName))
-        {
-            Transform child = currentSpellInstance.transform.Find(chargedChildName);
-            if (child != null)
-            {
-                chargedChildInstance = child.gameObject;
-                chargedChildInstance.SetActive(false);
-            }
-        }
-    }
+    // ---------------- PRZEJŚCIA ----------------
 
-    void FollowSpawnPoint()
-    {
-        if (currentSpellInstance == null || spellSpawnPoint == null) return;
+    bool CanStartCast()
+    {
+        if (!isAudioInitialized) return true;
 
-        currentSpellInstance.transform.position = spellSpawnPoint.position;
-        currentSpellInstance.transform.rotation = spellSpawnPoint.rotation;
-    }
+        // Nowe zaklęcie dopiero gdy dźwięk poprzedniego całkiem ucichnie
+        audioSystem.SpellSound.getPlaybackState(out PLAYBACK_STATE state);
+        return state == PLAYBACK_STATE.STOPPED;
+    }
 
-    void UpdateChargingVfx(float t)
-    {
-        if (currentVfxTransform != null)
-            currentVfxTransform.localScale = Vector3.one * scaleValue;
+    void StartCharging()
+    {
+        if (!SpawnSpell()) return;
 
-        if (currentParticleSystem != null)
-        {
-            var main = currentParticleSystem.main;
-            main.startColor = Color.Lerp(chargeStartColor, chargeEndColor, t);
-        }
-    }
+        chargeTimer = 0f;
+        currentState = SpellState.Charging;
 
-    void SetFullyChargedVfx()
-    {
-        if (currentVfxTransform != null)
-            currentVfxTransform.localScale = Vector3.one;
+        if (isAudioInitialized)
+            audioSystem.SpellCast();
+    }
 
-        if (currentParticleSystem != null)
-        {
-            var main = currentParticleSystem.main;
-            main.startColor = chargeEndColor;
-        }
+    void ReleaseCast()
+    {
+        FireSpell();
 
-        if (chargedChildInstance != null)
-            chargedChildInstance.SetActive(true);
-    }
+        if (isAudioInitialized)
+            audioSystem.SpellRelease();
 
-    void FireSpell(string reason)
-    {
-        if (currentSpellInstance == null) return;
+        ResetToIdle();
+    }
 
-        // Odpięcie od rodzica i wystrzelenie
-        if (currentSpellRb != null)
-        {
-            currentSpellInstance.transform.SetParent(null);
-            currentSpellRb.isKinematic = false;
+    void CancelCast()
+    {
+        if (currentSpellInstance != null)
+            Destroy(currentSpellInstance);
 
-            Vector3 shootDir = spellSpawnPoint != null ? spellSpawnPoint.forward : transform.forward;
-            currentSpellRb.linearVelocity = shootDir * spellShootForce;
-        }
-        
-        // Zniszczenie obiektu po czasie życia pocisku (zdefiniowane w innym skrypcie/prefabie)
-        // Zakładamy, że to już obsługuje Spell_new.cs lub inna logika
+        if (isAudioInitialized)
+        {
+            audioSystem.SpellCancel();
+            audioSystem.SpellRelease();
+        }
 
-        currentSpellInstance = null;
-        currentSpellRb = null;
-        currentParticleSystem = null;
-        currentVfxTransform = null;
-        chargedChildInstance = null;
-    }
+        ClearSpellReferences();
+        ResetToIdle();
+    }
 
-    void CancelSpell()
-    {
-        if (currentSpellInstance != null)
-            Destroy(currentSpellInstance);
+    void ResetToIdle()
+    {
+        chargeTimer = 0f;
+        currentState = SpellState.Idle;
+    }
 
-        currentSpellInstance = null;
-        currentSpellRb = null;
-        currentParticleSystem = null;
-        currentVfxTransform = null;
-        chargedChildInstance = null;
-    }
+    // ---------------- POCISK ----------------
+
+    bool SpawnSpell()
+    {
+        if (spellPrefab == null || spellSpawnPoint == null)
+        {
+            Debug.LogWarning("POMOCNIK: Brak spellPrefab albo spellSpawnPoint w spell_cast_new.");
+            return false;
+        }
+
+        currentSpellInstance = Instantiate(spellPrefab, spellSpawnPoint.position, spellSpawnPoint.rotation);
+
+        // Podczas ładowania fizyka nie rusza pocisku...
+        currentSpellRb = currentSpellInstance.GetComponent<Rigidbody>();
+        if (currentSpellRb != null)
+            currentSpellRb.isKinematic = true;
+
+        // ...a collidery są wyłączone, żeby nie trącał gracza ani otoczenia
+        currentSpellColliders = currentSpellInstance.GetComponentsInChildren<Collider>();
+        foreach (Collider c in currentSpellColliders)
+            c.enabled = false;
+
+        currentSpellLogic = currentSpellInstance.GetComponent<spell_new>();
+
+        // Efekt ładowania: najpierw pole ze spell_new, w razie braku szukamy po nazwie
+        GameObject chargeObj = null;
+        if (currentSpellLogic != null && currentSpellLogic.chargeChild != null)
+            chargeObj = currentSpellLogic.chargeChild;
+        else
+            chargeObj = FindChild(chargeChildFallbackName);
+
+        if (chargeObj != null)
+        {
+            // Skalujemy tylko efekt ładowania, z zachowaniem jego oryginalnej skali
+            chargeVfxTransform = chargeObj.transform;
+            chargeVfxBaseScale = chargeVfxTransform.localScale;
+            chargeVfxTransform.localScale = Vector3.zero;
+        }
+
+        // Które particle barwimy podczas ładowania
+        var tinted = new System.Collections.Generic.List<ParticleSystem>();
+        if (chargeObj != null)
+            tinted.AddRange(chargeObj.GetComponentsInChildren<ParticleSystem>());
+        if (tintRootSmoke)
+        {
+            ParticleSystem rootPs = currentSpellInstance.GetComponent<ParticleSystem>();
+            if (rootPs != null) tinted.Add(rootPs);
+        }
+        tintedParticleSystems = tinted.ToArray();
+        SetStartColor(chargeStartColor);
+
+        // Efekt "naładowany": wyłączony do momentu pełnego naładowania
+        if (currentSpellLogic != null && currentSpellLogic.chargedChild != null)
+            chargedVfx = currentSpellLogic.chargedChild;
+        else
+            chargedVfx = FindChild(chargedChildFallbackName);
+
+        if (chargedVfx != null)
+            chargedVfx.SetActive(false);
+
+        return true;
+    }
+
+    GameObject FindChild(string childName)
+    {
+        if (string.IsNullOrEmpty(childName) || currentSpellInstance == null) return null;
+        Transform child = currentSpellInstance.transform.Find(childName);
+        return child != null ? child.gameObject : null;
+    }
+
+    void FollowSpawnPoint()
+    {
+        if (currentSpellInstance == null || spellSpawnPoint == null) return;
+
+        currentSpellInstance.transform.SetPositionAndRotation(spellSpawnPoint.position, spellSpawnPoint.rotation);
+    }
+
+    void ApplyChargeVisuals(float scaleValue, float t)
+    {
+        if (chargeVfxTransform != null)
+            chargeVfxTransform.localScale = chargeVfxBaseScale * scaleValue;
+
+        SetStartColor(Color.Lerp(chargeStartColor, chargeEndColor, t));
+    }
+
+    void SetFullyChargedVisuals()
+    {
+        if (chargeVfxTransform != null)
+            chargeVfxTransform.localScale = chargeVfxBaseScale;
+
+        SetStartColor(chargeEndColor);
+
+        if (chargedVfx != null)
+            chargedVfx.SetActive(true);
+    }
+
+    void SetStartColor(Color color)
+    {
+        foreach (ParticleSystem ps in tintedParticleSystems)
+        {
+            if (ps == null) continue;
+            var main = ps.main;
+            main.startColor = color;
+        }
+    }
+
+    void FireSpell()
+    {
+        if (currentSpellInstance == null) return;
+
+        if (currentSpellColliders != null)
+            foreach (Collider c in currentSpellColliders)
+                if (c != null) c.enabled = true;
+
+        if (currentSpellRb != null)
+        {
+            currentSpellRb.isKinematic = false;
+            Vector3 shootDir = spellSpawnPoint != null ? spellSpawnPoint.forward : transform.forward;
+            currentSpellRb.linearVelocity = shootDir * spellShootForce;
+        }
+
+        // Od teraz pociskiem zarządza spell_new (licznik życia, uderzenie, zanikanie)
+        if (currentSpellLogic != null)
+            currentSpellLogic.Launch();
+
+        ClearSpellReferences();
+    }
+
+    void ClearSpellReferences()
+    {
+        currentSpellInstance = null;
+        currentSpellRb = null;
+        currentSpellColliders = null;
+        currentSpellLogic = null;
+        chargeVfxTransform = null;
+        chargeVfxBaseScale = Vector3.one;
+        tintedParticleSystems = new ParticleSystem[0];
+        chargedVfx = null;
+    }
 }
