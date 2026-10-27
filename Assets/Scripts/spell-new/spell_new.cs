@@ -8,9 +8,11 @@ using System.Collections.Generic;
 public class spell_new : MonoBehaviour
 {
     [Header("Dzieci VFX (przypisane w prefabie)")]
-    public GameObject chargeChild;   // Charge_FX - skalowane i barwione podczas ładowania
-    public GameObject chargedChild;  // Charged_FX - włączane po pełnym naładowaniu
+    public GameObject chargeChild;   // Charge_FX - orb: skalowany i barwiony podczas ładowania
+    public GameObject chargedChild;  // Charged_FX - ciemnoszary dym, włączany po pełnym naładowaniu
     public GameObject groundChild;   // Ground_Impact_FX - włączane po uderzeniu
+    public GameObject handSmokeChild; // Hand_Smoke_FX - czarny dym spod dłoni, sterowany przez spell_cast_new
+    public GameObject impactBurstChild; // Impact_Burst_FX - krótki wybuch w punkcie uderzenia
 
     [Header("Czasy")]
     [Tooltip("Po ilu sekundach lotu bez trafienia pocisk się niszczy.")]
@@ -41,6 +43,8 @@ public class spell_new : MonoBehaviour
         // żeby nie mignął przez jedną klatkę po Instantiate.
         if (groundChild != null)
             groundChild.SetActive(false);
+        if (impactBurstChild != null)
+            impactBurstChild.SetActive(false);
 
         // Root ParticleSystem miał Stop Action = Destroy, przez co po zatrzymaniu
         // dymu Unity samo niszczyło CAŁY pocisk (razem z efektem uderzenia).
@@ -104,6 +108,16 @@ public class spell_new : MonoBehaviour
 
         if (groundChild != null)
             groundChild.SetActive(true);
+
+        // Wybuch w faktycznym punkcie styku (collider nie musi leżeć w środku orba),
+        // skierowany wzdłuż normalnej powierzchni
+        if (impactBurstChild != null)
+        {
+            ContactPoint contact = collision.GetContact(0);
+            impactBurstChild.transform.SetPositionAndRotation(
+                contact.point, Quaternion.LookRotation(contact.normal));
+            impactBurstChild.SetActive(true);
+        }
 
         if (audioSystem != null)
             audioSystem.SpellImpactSound(transform.position);

@@ -2,30 +2,79 @@
 using FMOD.Studio; // PLAYBACK_STATE
 using FMODUnity;   // RuntimeManager, RuntimeUtils
 
-// Rzucanie zaklęcia z kamery: ładowanie (LPM trzymany), wystrzał (puszczenie LPM),
+// Rzucanie zaklęcia z kamery: ładowanie (LPM trzymany), pętla po naładowaniu,
+// krótki zamach (Casting) i wystrzał po puszczeniu LPM,
 // anulowanie (PPM albo puszczenie LPM przed naładowaniem).
 public class spell_cast_new : MonoBehaviour
 {
     [Header("Zaklęcie")]
     public GameObject spellPrefab;
     public Transform spellSpawnPoint;
-    public float chargeTime = 0.5f;
+    public float chargeTime = 2f;
     public float spellShootForce = 20f;
 
-    [Header("Wygląd ładowania")]
-    public Color chargeStartColor = Color.black;
-    public Color chargeEndColor = new Color(1f, 0.6235f, 0f);
+    [Header("Trajektoria: ładowanie (Charge)")]
+    [Tooltip("Jak nisko pod punktem dłoni orb zaczyna wznoszenie (m).")]
+    public float chargeRiseHeight = 0.5f;
+    [Tooltip("Jak daleko orb buja się na boki podczas wznoszenia (m).")]
+    public float chargeWobbleWidth = 0.06f;
+    [Tooltip("Ile pełnych wychyleń lewo-prawo w trakcie ładowania.")]
+    public float chargeWobbleCount = 1.5f;
+
+    [Header("Trajektoria: pętla po naładowaniu (Charged Loop)")]
+    [Tooltip("Czas jednego okrążenia. Pętle na zmianę: v1, v2, v1...")]
+    public float loopDuration = 1.5f;
+    [Tooltip("Pół-osie elipsy w płaszczyźnie ekranu (szerokość, wysokość).")]
+    public Vector2 loopRadius = new Vector2(0.35f, 0.08f);
+    [Tooltip("Jak daleko orb wychodzi do przodu/do tyłu na okrążeniu.")]
+    public float loopDepth = 0.15f;
+    [Tooltip("Nachylenie pętli v1 (stopnie, + = prawa strona wyżej).")]
+    public float loopTiltV1 = 15f;
+    [Tooltip("Nachylenie pętli v2 (stopnie, - = prawa strona niżej).")]
+    public float loopTiltV2 = -20f;
+    public Vector3 loopCenterV1 = Vector3.zero;
+    public Vector3 loopCenterV2 = new Vector3(0.05f, 0.05f, 0f);
+    [Tooltip("Jaka część okrążenia płynnie przechodzi w kolejny wariant.")]
+    [Range(0f, 1f)] public float loopBlend = 0.3f;
+    [Tooltip("Lekkie bujanie nachylenia pętli (stopnie).")]
+    public float loopDriftAngle = 6f;
+    [Tooltip("Czas płynnego wejścia z ładowania w pętlę.")]
+    public float loopEntryTime = 0.3f;
+
+    [Header("Rzut (Casting)")]
+    [Tooltip("Ile trwa zamach po puszczeniu LPM, zanim pocisk poleci.")]
+    public float castDuration = 0.2f;
+    [Tooltip("O ile orb przesuwa się (hamując) w trakcie zamachu, lokalnie dla dłoni.")]
+    public Vector3 castOffset = new Vector3(0f, 0.08f, 0.15f);
+
+    [Header("Kolory orba (Purple Main + iskry)")]
+    public Color chargeStartColor = new Color(0f, 1f, 1f);
+    public Color chargeEndColor = new Color(0.25f, 0.12f, 0.75f);
+    public Color chargedColor = new Color(0.878f, 0.145f, 0.794f);
+    [Tooltip("Ile sekund po naładowaniu kolor przechodzi do chargedColor.")]
+    public float chargedColorTime = 1f;
     public AnimationCurve chargeCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
-    [Tooltip("Barwi też dym na roocie prefabu (tak działała stara wersja).")]
-    public bool tintRootSmoke = false;
+
+    [Header("Czarny dym spod dłoni")]
+    [Tooltip("Jak nisko pod punktem dłoni rodzi się dym. Wierzch dymu sięga wysokości orba.")]
+    public float handSmokeDrop = 0.65f;
+    public float handSmokeRateCharging = 20f;
+    public float handSmokeRateCharged = 45f;
+    public float handSmokeSpeedCharging = 0.25f;
+    public float handSmokeSpeedCharged = 0.5f;
 
     [Header("Zapasowe nazwy dzieci (gdy prefab nie ma spell_new z przypisanymi polami)")]
     public string chargeChildFallbackName = "Charge_FX";
     public string chargedChildFallbackName = "Charged_FX";
+    public string handSmokeChildFallbackName = "Hand_Smoke_FX";
 
-    private enum SpellState { Idle, Charging, Holding }
+    private enum SpellState { Idle, Charging, Holding, Casting }
     private SpellState currentState = SpellState.Idle;
     private float chargeTimer = 0f;
+    private float holdTimer = 0f;
+    private float castTimer = 0f;
+    private Vector3 currentOffset = Vector3.zero; // pozycja orba względem dłoni
+    private Vector3 castStartOffset = Vector3.zero;
 
     // Referencje do aktualnie ładowanego pocisku
     private GameObject currentSpellInstance;
@@ -36,6 +85,7 @@ public class spell_cast_new : MonoBehaviour
     private Vector3 chargeVfxBaseScale = Vector3.one;
     private ParticleSystem[] tintedParticleSystems = new ParticleSystem[0];
     private GameObject chargedVfx;
+    private ParticleSystem handSmoke;
 
     // Audio FMOD
     private AudioSystem audioSystem;
@@ -71,10 +121,22 @@ public class spell_cast_new : MonoBehaviour
             case SpellState.Idle: HandleIdleState(); break;
             case SpellState.Charging: HandleChargingState(); break;
             case SpellState.Holding: HandleHoldingState(); break;
+            case SpellState.Casting: HandleCastingState(); break;
         }
 
         if (isAudioInitialized)
             audioSystem.SpellSound.set3DAttributes(RuntimeUtils.To3DAttributes(transform));
+    }
+
+    // Pozycjonowanie dopiero w LateUpdate: FPSController rusza graczem i kamerą w swoim Update,
+    // a kolejność Update między skryptami jest dowolna. Orb ustawiany w Update był w części klatek
+    // liczony od nieaktualnej pozycji dłoni i "skakał" między dwoma miejscami (dwa orby na ekranie).
+    void LateUpdate()
+    {
+        if (currentState == SpellState.Idle) return;
+
+        FollowSpawnPoint();
+        PlaceHandSmoke();
     }
 
     // ---------------- STANY ----------------
@@ -98,11 +160,13 @@ public class spell_cast_new : MonoBehaviour
         chargeTimer += Time.deltaTime;
         float t = chargeTime > 0f ? Mathf.Clamp01(chargeTimer / chargeTime) : 1f;
 
-        FollowSpawnPoint();
+        currentOffset = GetChargeOffset(t);
+        UpdateHandSmoke(handSmokeRateCharging, handSmokeSpeedCharging);
         ApplyChargeVisuals(chargeCurve.Evaluate(t), t);
 
         if (t >= 1f)
         {
+            holdTimer = 0f;
             currentState = SpellState.Holding;
             SetFullyChargedVisuals();
         }
@@ -114,10 +178,41 @@ public class spell_cast_new : MonoBehaviour
 
         if (Input.GetMouseButtonDown(1)) { CancelCast(); return; }
 
-        FollowSpawnPoint();
+        holdTimer += Time.deltaTime;
+
+        // Płynne wejście z końca ładowania (punkt dłoni) w okrążenie
+        Vector3 loopOffset = GetLoopOffset(holdTimer);
+        float entry = loopEntryTime > 0f ? Mathf.SmoothStep(0f, 1f, holdTimer / loopEntryTime) : 1f;
+        currentOffset = Vector3.Lerp(GetChargeOffset(1f), loopOffset, entry);
+
+        UpdateHandSmoke(handSmokeRateCharged, handSmokeSpeedCharged);
+
+        // Przez pierwszą sekundę pętli kolor przechodzi z ciemnego fioletu w różowy fiolet
+        float colorT = chargedColorTime > 0f ? Mathf.Clamp01(holdTimer / chargedColorTime) : 1f;
+        SetStartColor(Color.Lerp(chargeEndColor, chargedColor, colorT));
 
         if (!Input.GetMouseButton(0))
-            ReleaseCast();
+            StartCasting();
+    }
+
+    void HandleCastingState()
+    {
+        if (currentSpellInstance == null) { CancelCast(); return; }
+
+        castTimer += Time.deltaTime;
+        float t = castDuration > 0f ? Mathf.Clamp01(castTimer / castDuration) : 1f;
+
+        // Nagła zmiana toru: orb gwałtownie hamuje i lekko się unosi (ease-out)
+        float braked = 1f - Mathf.Pow(1f - t, 3f);
+        currentOffset = castStartOffset + castOffset * braked;
+
+        UpdateHandSmoke(handSmokeRateCharged, handSmokeSpeedCharged);
+
+        if (t >= 1f)
+        {
+            FireSpell();
+            ResetToIdle();
+        }
     }
 
     // ---------------- PRZEJŚCIA ----------------
@@ -142,14 +237,15 @@ public class spell_cast_new : MonoBehaviour
             audioSystem.SpellCast();
     }
 
-    void ReleaseCast()
+    void StartCasting()
     {
-        FireSpell();
-
+        // Dźwięk wypuszczenia leci od razu z puszczeniem LPM, tak jak wcześniej
         if (isAudioInitialized)
             audioSystem.SpellRelease();
 
-        ResetToIdle();
+        castTimer = 0f;
+        castStartOffset = currentOffset;
+        currentState = SpellState.Casting;
     }
 
     void CancelCast()
@@ -170,7 +266,56 @@ public class spell_cast_new : MonoBehaviour
     void ResetToIdle()
     {
         chargeTimer = 0f;
+        holdTimer = 0f;
+        castTimer = 0f;
+        currentOffset = Vector3.zero;
         currentState = SpellState.Idle;
+    }
+
+    // ---------------- TRAJEKTORIA ----------------
+
+    // Od dołu do góry, bujając się na boki. t = 0..1, na końcu orb jest w punkcie dłoni.
+    public Vector3 GetChargeOffset(float t)
+    {
+        float x = chargeWobbleWidth * Mathf.Sin(t * chargeWobbleCount * 2f * Mathf.PI);
+        float y = -chargeRiseHeight * (1f - t);
+        return new Vector3(x, y, 0f);
+    }
+
+    // Okrążenia po naładowaniu: parzyste = v1, nieparzyste = v2,
+    // pod koniec każdego okrążenia nachylenie i środek płynnie przechodzą w kolejny wariant.
+    public Vector3 GetLoopOffset(float loopTime)
+    {
+        float duration = Mathf.Max(0.01f, loopDuration);
+        float cycle = loopTime / duration;
+        int index = Mathf.FloorToInt(cycle);
+        float frac = cycle - index;
+        bool isV2 = (index % 2) == 1;
+
+        float blend = loopBlend > 0f ? Mathf.SmoothStep(0f, 1f, (frac - (1f - loopBlend)) / loopBlend) : 0f;
+
+        float tiltFrom = isV2 ? loopTiltV2 : loopTiltV1;
+        float tiltTo = isV2 ? loopTiltV1 : loopTiltV2;
+        Vector3 centerFrom = isV2 ? loopCenterV2 : loopCenterV1;
+        Vector3 centerTo = isV2 ? loopCenterV1 : loopCenterV2;
+
+        float tilt = Mathf.Lerp(tiltFrom, tiltTo, blend) + loopDriftAngle * Mathf.Sin(loopTime * 0.8f);
+        Vector3 center = Vector3.Lerp(centerFrom, centerTo, blend);
+
+        float phase = cycle * 2f * Mathf.PI;
+        Vector2 p = new Vector2(Mathf.Cos(phase) * loopRadius.x, Mathf.Sin(phase) * loopRadius.y);
+        float rad = tilt * Mathf.Deg2Rad;
+        Vector2 rotated = new Vector2(
+            p.x * Mathf.Cos(rad) - p.y * Mathf.Sin(rad),
+            p.x * Mathf.Sin(rad) + p.y * Mathf.Cos(rad));
+
+        return center + new Vector3(rotated.x, rotated.y, Mathf.Sin(phase) * loopDepth);
+    }
+
+    Vector3 OffsetToWorld(Vector3 offset)
+    {
+        // Bez skali dłoni, żeby wymiary trajektorii były w metrach
+        return spellSpawnPoint.position + spellSpawnPoint.rotation * offset;
     }
 
     // ---------------- POCISK ----------------
@@ -183,7 +328,8 @@ public class spell_cast_new : MonoBehaviour
             return false;
         }
 
-        currentSpellInstance = Instantiate(spellPrefab, spellSpawnPoint.position, spellSpawnPoint.rotation);
+        currentOffset = GetChargeOffset(0f);
+        currentSpellInstance = Instantiate(spellPrefab, OffsetToWorld(currentOffset), spellSpawnPoint.rotation);
 
         // Podczas ładowania fizyka nie rusza pocisku...
         currentSpellRb = currentSpellInstance.GetComponent<Rigidbody>();
@@ -197,7 +343,7 @@ public class spell_cast_new : MonoBehaviour
 
         currentSpellLogic = currentSpellInstance.GetComponent<spell_new>();
 
-        // Efekt ładowania: najpierw pole ze spell_new, w razie braku szukamy po nazwie
+        // Efekt ładowania (orb): najpierw pole ze spell_new, w razie braku szukamy po nazwie
         GameObject chargeObj = null;
         if (currentSpellLogic != null && currentSpellLogic.chargeChild != null)
             chargeObj = currentSpellLogic.chargeChild;
@@ -210,21 +356,13 @@ public class spell_cast_new : MonoBehaviour
             chargeVfxTransform = chargeObj.transform;
             chargeVfxBaseScale = chargeVfxTransform.localScale;
             chargeVfxTransform.localScale = Vector3.zero;
-        }
 
-        // Które particle barwimy podczas ładowania
-        var tinted = new System.Collections.Generic.List<ParticleSystem>();
-        if (chargeObj != null)
-            tinted.AddRange(chargeObj.GetComponentsInChildren<ParticleSystem>());
-        if (tintRootSmoke)
-        {
-            ParticleSystem rootPs = currentSpellInstance.GetComponent<ParticleSystem>();
-            if (rootPs != null) tinted.Add(rootPs);
+            // Barwimy wszystkie particle orba (rdzeń i iskry)
+            tintedParticleSystems = chargeObj.GetComponentsInChildren<ParticleSystem>();
         }
-        tintedParticleSystems = tinted.ToArray();
         SetStartColor(chargeStartColor);
 
-        // Efekt "naładowany": wyłączony do momentu pełnego naładowania
+        // Efekt "naładowany" (ciemnoszary dym): wyłączony do momentu pełnego naładowania
         if (currentSpellLogic != null && currentSpellLogic.chargedChild != null)
             chargedVfx = currentSpellLogic.chargedChild;
         else
@@ -233,6 +371,18 @@ public class spell_cast_new : MonoBehaviour
         if (chargedVfx != null)
             chargedVfx.SetActive(false);
 
+        // Czarny dym spod dłoni: stoi przy dłoni, nie lata z orbem
+        GameObject handSmokeObj = null;
+        if (currentSpellLogic != null && currentSpellLogic.handSmokeChild != null)
+            handSmokeObj = currentSpellLogic.handSmokeChild;
+        else
+            handSmokeObj = FindChild(handSmokeChildFallbackName);
+
+        if (handSmokeObj != null)
+            handSmoke = handSmokeObj.GetComponent<ParticleSystem>();
+
+        PlaceHandSmoke();
+        UpdateHandSmoke(handSmokeRateCharging, handSmokeSpeedCharging);
         return true;
     }
 
@@ -247,7 +397,29 @@ public class spell_cast_new : MonoBehaviour
     {
         if (currentSpellInstance == null || spellSpawnPoint == null) return;
 
-        currentSpellInstance.transform.SetPositionAndRotation(spellSpawnPoint.position, spellSpawnPoint.rotation);
+        currentSpellInstance.transform.SetPositionAndRotation(OffsetToWorld(currentOffset), spellSpawnPoint.rotation);
+    }
+
+    void PlaceHandSmoke()
+    {
+        if (handSmoke == null || spellSpawnPoint == null) return;
+
+        // Dziecko poruszającego się pocisku, więc co klatkę wracamy pod dłoń
+        handSmoke.transform.SetPositionAndRotation(
+            OffsetToWorld(new Vector3(0f, -handSmokeDrop, 0f)), spellSpawnPoint.rotation);
+    }
+
+    void UpdateHandSmoke(float rate, float speed)
+    {
+        if (handSmoke == null) return;
+
+        var emission = handSmoke.emission;
+        emission.rateOverTime = rate;
+
+        // Czas życia dobrany tak, żeby wierzch dymu kończył się na wysokości orba
+        var main = handSmoke.main;
+        main.startSpeed = speed;
+        main.startLifetime = speed > 0f ? handSmokeDrop / speed : 1f;
     }
 
     void ApplyChargeVisuals(float scaleValue, float t)
@@ -283,6 +455,21 @@ public class spell_cast_new : MonoBehaviour
     {
         if (currentSpellInstance == null) return;
 
+        // Wystrzał z końcowej pozycji zamachu
+        FollowSpawnPoint();
+
+        // Dym "naładowany" i dym z dłoni są tylko na czas ładowania/trzymania
+        if (chargedVfx != null)
+            foreach (ParticleSystem ps in chargedVfx.GetComponentsInChildren<ParticleSystem>())
+                ps.Stop(false, ParticleSystemStopBehavior.StopEmitting);
+
+        if (handSmoke != null)
+        {
+            // Odczepiamy od pocisku, żeby resztki dymu dogasły przy dłoni (Stop Action = Destroy)
+            handSmoke.transform.SetParent(null, true);
+            handSmoke.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+        }
+
         if (currentSpellColliders != null)
             foreach (Collider c in currentSpellColliders)
                 if (c != null) c.enabled = true;
@@ -311,5 +498,34 @@ public class spell_cast_new : MonoBehaviour
         chargeVfxBaseScale = Vector3.one;
         tintedParticleSystems = new ParticleSystem[0];
         chargedVfx = null;
+        handSmoke = null;
+    }
+
+    // Podgląd trajektorii w Scene view (zaznacz obiekt z tym skryptem)
+    void OnDrawGizmosSelected()
+    {
+        if (spellSpawnPoint == null) return;
+
+        Gizmos.color = Color.red;
+        Vector3 prev = OffsetToWorld(GetChargeOffset(0f));
+        for (int i = 1; i <= 40; i++)
+        {
+            Vector3 next = OffsetToWorld(GetChargeOffset(i / 40f));
+            Gizmos.DrawLine(prev, next);
+            prev = next;
+        }
+
+        // Dwa okrążenia: v1 i v2
+        Gizmos.color = new Color(1f, 0.4f, 0.4f);
+        prev = OffsetToWorld(GetLoopOffset(0f));
+        for (int i = 1; i <= 120; i++)
+        {
+            Vector3 next = OffsetToWorld(GetLoopOffset(i / 120f * loopDuration * 2f));
+            Gizmos.DrawLine(prev, next);
+            prev = next;
+        }
+
+        Gizmos.color = new Color(0.6f, 0.6f, 0.6f);
+        Gizmos.DrawWireSphere(OffsetToWorld(new Vector3(0f, -handSmokeDrop, 0f)), 0.03f);
     }
 }
